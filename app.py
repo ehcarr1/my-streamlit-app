@@ -416,7 +416,8 @@ RISK_SCHEMA = {  # 자유 문장 대신 항목별 자료로 받아 화면과 체
         "properties": {
             "category": {"type": "string", "enum": list(RISK_CATEGORIES)},
             "issue": {"type": "string"}, "evidence": {"type": "string"},
-            "question": {"type": "string"}, "action": {"type": "string"},
+            "question": {"type": "string"},  # 상대에게 물을 구체적인 확인 질문
+            "action": {"type": "string", "description": "업무 대상과 확인할 정보를 포함한 독립적인 과제 제목. 예: 홍보 영상 제작 일정의 확인 마감일 정하기. 확인하기 또는 정하기만 쓰면 안 됨."},
         },
         "required": list(RISK_FIELDS), "additionalProperties": False,
     }}},
@@ -426,6 +427,31 @@ RISK_SCHEMA = {  # 자유 문장 대신 항목별 자료로 받아 화면과 체
 
 def compact_text(text):  # 줄바꿈·띄어쓰기에 흔들리지 않게 비교용 문자열 생성
     return re.sub(r"\s+", "", text)  # 표시할 원문은 별도로 보존
+
+
+def generic_followup_action(value):  # 확인 대상 없이 동작·분류만 적힌 제목인지 검사
+    token = re.sub(r"[^0-9A-Za-z가-힣]", "", value)  # 공백·따옴표·슬래시로 검사가 달라지지 않게 정리
+    if not token:  # 빈 제목이라면
+        return True  # 구체적인 제목이 필요
+    vague = {"업무", "사항", "내용", "확인할일", "확인할사항", "확인필요", "담당자미정", "기한미정", "일정미정", "업무범위불명확"}  # 대상이 드러나지 않는 표현
+    if token in vague:  # 동작 없이 분류만 있는 경우도
+        return True  # 기존 근거로 제목 보완
+    return bool(re.fullmatch(r"(?:(?:관련|해당|추가|내용|사항|업무|담당자|기한|일정|범위|완료기준)*(?:확인|검토|논의|협의|조율|점검|정리|결정|지정|설정|정)(?:하기|필요|요청|진행|완료)?(?:또는|및|후)?)+", token))  # '확인하기/정하기' 등 검사
+
+
+def followup_action(item):  # 제목 하나만 읽어도 무엇을 확인할지 알 수 있게 보완
+    action = re.sub(r"\s+", " ", item.get("action", "")).strip()  # 모델 출력 또는 저장된 제목 정리
+    if not generic_followup_action(action):  # 구체적인 제목이 이미 있다면
+        return action  # 사용자가 수정한 제목도 그대로 유지
+    subject = re.sub(r"\s+", " ", item.get("issue", "")).strip(" \t\n.*#-:：")  # 같은 리스크의 확인 대상 사용
+    subject = re.sub(r"\s*(?:확인\s*필요|미정|미확정|누락|불명확|불분명|미지정)[.!?。]*$", "", subject).strip()  # 제목 끝의 문제 상태만 정리
+    if subject and not generic_followup_action(subject):  # 확인할 대상이 있으면
+        return subject[:270].rstrip() + " 확인하기"  # 새 인물·날짜·사실을 만들지 않고 제목 보완
+    question = re.sub(r"\s+", " ", item.get("question", "")).strip()  # 문제가 너무 추상적이면 기존 질문 사용
+    if question and not generic_followup_action(question):  # 구체적인 질문이 있다면
+        return "확인 요청: " + question[:290].rstrip()  # 어떤 답변이 필요한지 직접 표시
+    evidence = re.sub(r"\s+", " ", item.get("evidence", "")).strip()[:230]  # 근거만 남은 경우에도 대상을 표시
+    return f'회의록 “{evidence}”의 {item.get("category", "업무 내용")} 확인하기'  # 일반 동작 단어만 표시되는 것을 방지
 
 
 def risk_item_id(category, evidence):  # 같은 근거의 같은 점검 항목을 식별
@@ -450,6 +476,7 @@ def validate_risk_payload(payload, meeting_text):  # 모델의 자료 형식과 
         if compact_text(clean["evidence"]) not in source:  # 원문에 없는 근거이면
             rejected += 1  # 근거가 검증되지 않은 후보로 집계
             continue  # 체크리스트에도 넘기지 않음
+        clean["action"] = followup_action(clean)  # 동작 단어만 온 경우 원래 리스크의 확인 대상으로 보완
         clean["id"] = risk_item_id(clean["category"], clean["evidence"])  # 같은 항목 식별
         if clean["id"] not in seen:  # 중복된 후보가 아니라면
             seen.add(clean["id"])  # 중복 검사 목록 갱신
@@ -468,7 +495,12 @@ def analyze_risks(meeting_text):  # 기존 모델로 리스크와 후속 확인 
 회의록에 없는 인물, 날짜, 합의, 위험을 만들지 마세요. 자세한 설명이 없다는 이유만으로 모든 일을 리스크로 만들지 마세요.
 각 항목의 evidence는 회의록에서 그대로 복사한 짧은 문구여야 합니다. 인용부호나 설명을 덧붙이지 마세요.
 issue는 확인이 필요한 내용, question은 상대에게 물을 질문, action은 사용자가 체크할 수 있는 한 가지 확인 업무입니다.
-action에는 '확인하기', '정하기' 등 실행할 일을 적되 확인 담당자·확인 기한을 임의로 지정하지 마세요.
+action은 화면의 체크박스·체크리스트 제목으로 그대로 사용합니다. 제목만 읽어도 확인할 업무 대상과 필요한 답변이 드러나야 합니다.
+반드시 '구체적인 업무 대상 + 확인할 정보 + 실행 동작'을 포함한 한 문장으로 작성하세요.
+금지 예시: '확인하기', '정하기', '내용 확인하기', '기한 정하기'. 이런 동작 단어만 단독으로 쓰면 안 됩니다.
+올바른 제목 형식 예시: '홍보 영상 제작 일정 확인의 마감일 정하기', '인플루언서 협업 비용을 논의할 시점 확인하기'.
+위 예시는 문장 형식만 참고하세요. 실제 action의 대상·이름·날짜는 이번 회의록의 내용만 사용하세요.
+확인 담당자·확인 기한을 임의로 지정하지 마세요.
 중복 없이 최대 12개를 제안하세요. 확인 과제가 없으면 items를 빈 목록으로 반환하세요."""  # 최종 결정과 근거를 우선하는 분석 지시
     response = client.responses.create(  # 기존 OpenAI 클라이언트 재사용
         model="gpt-4o-mini",  # 기존 분석 모델 유지
@@ -484,7 +516,7 @@ action에는 '확인하기', '정하기' 등 실행할 일을 적되 확인 담�
 def risk_items_markdown(items):  # 구조화된 자료를 기존 파스텔 결과 카드에 표시
     blocks = []  # 각 항목의 표시 문장
     for index, item in enumerate(items, 1):  # 순서대로 표시
-        blocks.append(f'{index}. **{item["category"]} 확인 필요**: {item["issue"]}\n   - **회의록의 근거:** {item["evidence"]}\n   - **확인할 질문:** {item["question"]}\n   - **후속 확인 업무:** {item["action"]}')  # 원문 근거·질문·실행 항목
+        blocks.append(f'{index}. **{item["category"]} 확인 필요**: {item["issue"]}\n   - **회의록의 근거:** {item["evidence"]}\n   - **확인할 질문:** {item["question"]}\n   - **후속 확인 업무:** {followup_action(item)}')  # 모든 화면에서 같은 구체적인 제목 사용
     return "\n\n".join(blocks)  # 항목이 있을 때 무위험 안내문을 덧붙이지 않음
 
 
@@ -495,17 +527,15 @@ def document_followups(document_hash):  # 회의록별로 체크리스트를 분
 def add_followups(document_hash, candidates):  # 선택한 후보만 체크리스트에 등록
     tasks = list(document_followups(document_hash))  # 현재 회의록의 기존 기록 유지
     seen_ids = {t["id"] for t in tasks}  # 등록된 항목 식별값
-    seen_actions = {compact_text(t["action"]) for t in tasks}  # 동일한 확인 업무도 중복 방지
     added = 0  # 새 등록 건수
     for item in candidates:  # 사용자가 선택한 후보만 처리
-        if item["id"] in seen_ids or compact_text(item["action"]) in seen_actions:  # 이미 등록한 항목
+        if item["id"] in seen_ids:  # 제목이 같아도 근거가 다른 리스크는 각각 등록
             continue  # 완료 상태와 확인 결과를 덮어쓰지 않음
         if len(tasks) >= MAX_FOLLOWUP_TASKS:  # 불러올 수 있는 개수와 등록 한도 일치
             break  # 기존 기록을 유지하며 추가 중단
-        task = {**item, "owner": "", "due": "", "resolution": "", "status": "미확인"}  # 담당자·날짜는 사용자 입력
+        task = {**item, "action": followup_action(item), "owner": "", "due": "", "resolution": "", "status": "미확인"}  # 구체적인 확인 업무 등록
         tasks.append(task)  # 새 확인 업무 추가
         seen_ids.add(task["id"])  # 같은 클릭 안의 중복도 방지
-        seen_actions.add(compact_text(task["action"]))  # 업무 제목 중복 확인
         added += 1  # 추가 건수 갱신
     st.session_state.followups_by_document = {**st.session_state.followups_by_document, document_hash: tasks}  # 현재 문서만 갱신
     return added  # 등록 결과 안내에 사용
@@ -515,6 +545,8 @@ def update_followup(document_hash, task_id, action, owner, due, resolution, stat
     action, owner, due, resolution = (x.strip() for x in (action, owner, due, resolution))  # 입력 공백 정리
     if not action or len(action) > 300 or len(owner) > 100 or len(resolution) > 2000:  # 입력 길이 확인
         raise ValueError("확인할 일은 1~300자, 담당자는 100자, 확인 결과는 2,000자 이내로 입력해 주세요.")  # 저장 중단
+    if generic_followup_action(action):  # '확인하기'처럼 대상이 없는 편집 제목이면
+        raise ValueError("무엇을 확인할지 함께 적어 주세요. 예: '홍보 영상 제작 일정 확인의 마감일 정하기'")  # 불명확한 제목 저장 방지
     if status not in FOLLOWUP_STATUSES:  # 상태 값 확인
         raise ValueError("처리 상태를 다시 선택해 주세요.")  # 알 수 없는 상태 방지
     if status != "미확인" and not resolution:  # 완료·제외에는 판단 기록이 필요
@@ -540,7 +572,7 @@ def followup_request_text(tasks, document_name):  # 미확인 항목만 모아 �
         return ""  # 빈 요청문을 만들지 않음
     lines = [f"회의록 확인 요청: {document_name}", "", "아래 사항의 확인을 부탁드립니다.", ""]  # 공유 문안 시작
     for number, task in enumerate(pending, 1):  # 남은 항목을 순서대로 정리
-        lines.extend([f'{number}. {task["action"]}', f'   확인할 질문: {task["question"]}'])  # 확인할 일과 질문
+        lines.extend([f'{number}. {followup_action(task)}', f'   확인할 질문: {task["question"]}'])  # 공유 문안에도 구체적인 확인 대상 표시
         if task["owner"]:  # 사용자가 지정한 담당자가 있으면
             lines.append(f'   확인 담당자: {task["owner"]}')  # 지정한 정보만 표시
         if task["due"]:  # 사용자가 지정한 확인 기한이 있으면
@@ -598,13 +630,87 @@ def parse_followup_import(contents, document_hash, meeting_text):  # 저장 내�
                 date.fromisoformat(task["due"])  # 실제 날짜 확인
             except ValueError as exc:  # 손상된 확인 기한
                 raise ValueError("확인 기한이 올바르지 않은 항목이 있습니다.") from exc  # 전체 불러오기 중단
+        task["action"] = followup_action(task)  # 이전 버전에서 저장한 단어뿐인 제목도 복구
         clean.append(task)  # 검증된 항목 보관
         seen.add(task["id"])  # 중복 검사 갱신
     return clean  # 호출한 화면에서 검증 완료 후 목록 교체
 
 
+def repair_existing_followup_titles():  # 코드 업데이트 시 이미 등록된 항목의 제목을 복구
+    documents = st.session_state.followups_by_document  # 기존 진행 기록
+    repaired = {}  # 문서별로 복구한 목록
+    changed = False  # 실제로 고친 항목이 있는지 확인
+    for document_hash, tasks in documents.items():  # 다른 회의록의 기록도 보존
+        repaired[document_hash] = []  # 해당 문서의 새 목록
+        for task in tasks:  # 저장한 항목별로
+            title = followup_action(task) if generic_followup_action(task["action"]) else task["action"]  # 불명확한 제목만 보완
+            if title != task["action"]:  # 제목이 변경되었다면
+                changed = True  # 기록 갱신 필요
+                widget_key = f'_fu_{document_hash}_{task["id"]}_action'  # 기존 입력칸의 값도 찾기
+                if widget_key in st.session_state and generic_followup_action(st.session_state[widget_key]):  # 사용자 작성 문장은 보존
+                    st.session_state[widget_key] = title  # 위젯 생성 전에 복구한 제목 반영
+            repaired[document_hash].append({**task, "action": title})  # 담당자·기한·결과·상태는 그대로 보존
+    if changed:  # 단어뿐인 저장 제목이 있었다면
+        st.session_state.followups_by_document = repaired  # 복구한 목록 적용
+    items = st.session_state.risk_items  # 이미 분석해 둔 후보
+    fixed_items = [{**item, "action": followup_action(item)} for item in items]  # 재분석 없이 후보 제목도 보완
+    if fixed_items != items:  # 표시할 후보가 달라졌다면
+        st.session_state.risk_items = fixed_items  # 기존 근거와 식별값은 유지
+        st.session_state.risk_result = risk_items_markdown(fixed_items)  # 상세 결과도 같은 제목 사용
+
+
 FOLLOWUP_CSS = """
 <style>
+/* 어두운 브라우저·Streamlit 테마에서도 펼침 제목과 선택 요소는 밝은 디자인 유지 */
+.stApp [data-testid="stExpander"] summary,
+.stApp [data-testid="stExpander"] summary:hover,
+.stApp [data-testid="stExpander"] summary:focus,
+.stApp [data-testid="stExpander"] summary:focus-visible {
+  background: #f7f4fd !important; color: #514464 !important;
+  border-radius: 13px !important; opacity: 1 !important;
+}
+.stApp [data-testid="stExpander"] summary p,
+.stApp [data-testid="stExpander"] summary span,
+.stApp [data-testid="stExpander"] summary svg {
+  color: #514464 !important; fill: currentColor; opacity: 1 !important;
+}
+.stApp [data-testid="stExpander"] [data-testid="stExpanderDetails"] {
+  background: #fff !important; color: #423951 !important;
+}
+.st-key-risk_card [data-testid="stCheckbox"] label > div:first-of-type,
+.st-key-followup_card [data-testid="stCheckbox"] label > div:first-of-type {
+  background: #fff !important; border: 1px solid #9d85c1 !important; border-radius: 5px !important;
+}
+.st-key-risk_card [data-testid="stCheckbox"] label:has(input:checked) > div:first-of-type,
+.st-key-followup_card [data-testid="stCheckbox"] label:has(input:checked) > div:first-of-type {
+  background: #8464cf !important; border-color: #8464cf !important;
+}
+.st-key-risk_card [data-testid="stCheckbox"] label:has(input:checked) svg,
+.st-key-followup_card [data-testid="stCheckbox"] label:has(input:checked) svg { color:#fff !important; fill:#fff !important; }
+.st-key-risk_card [data-testid="stCheckbox"]:has(input:disabled) label,
+.st-key-risk_card [data-testid="stCheckbox"]:has(input:disabled) p { color:#655878 !important; opacity:1 !important; }
+.st-key-followup_card [data-testid="stRadioOption"] > div:first-of-type {
+  background: transparent !important; border: 0 !important;
+}
+.st-key-followup_card [data-testid="stRadioOption"] > div:first-of-type > div:first-of-type {
+  background: #fff !important; border: 1px solid #9d85c1 !important; border-radius: 50% !important;
+}
+.st-key-followup_card [data-testid="stRadioOption"]:has(input:checked) > div:first-of-type > div:first-of-type {
+  background: #8464cf !important; border-color: #8464cf !important;
+}
+.st-key-followup_card [data-testid="stRadioOption"] > div:first-of-type > div:first-of-type > div {
+  background: transparent !important;
+}
+.st-key-followup_card [data-testid="stRadioOption"]:has(input:checked) > div:first-of-type > div:first-of-type > div {
+  background: #fff !important;
+}
+.st-key-followup_card input::placeholder,
+.st-key-followup_card textarea::placeholder { color:#8f829e !important; opacity:1 !important; }
+.stApp [data-testid="stDownloadButton"] button {
+  background:#fff !important; color:#6b5289 !important; border:1px solid #e3dbee !important; border-radius:13px !important;
+}
+.stApp [data-testid="stDownloadButton"] button p { color:#6b5289 !important; }
+.stApp [data-testid="stDownloadButton"] button:hover { background:#f7f4fd !important; border-color:#ad92d9 !important; }
 .st-key-followup_card { background: #ffffffed; border: 1px solid #e8e4f3; border-radius: 22px; padding: 1.1rem 1.3rem; box-shadow: 0 7px 23px #58407606; }
 .followup-summary { display:flex; flex-wrap:wrap; gap:.5rem; margin:.6rem 0 .8rem; }
 .followup-summary span { border-radius:999px; padding:.3rem .7rem; font-size:.78rem; background:#f3eefc; color:#77559b; }
@@ -731,6 +837,7 @@ def render_followup_checklist(meeting_text):  # 확인 결과 기록·보관·�
 
 
 st.markdown(FOLLOWUP_CSS, unsafe_allow_html=True)  # 기존 화면에 후속 관리 스타일 추가
+repair_existing_followup_titles()  # 기존 세션의 단어뿐인 제목도 진행 내용은 유지하며 복구
 # [리스크 후속 관리 끝]
 
 

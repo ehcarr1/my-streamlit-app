@@ -432,6 +432,35 @@ def personal_compact(value):  # 원문 인용과 표기 비교
     return re.sub(r"\s+", "", value)  # 원문 표시 자체는 바꾸지 않음
 
 
+def personal_subject(value):  # 모델이 업무 대상에 동작까지 붙인 경우 분리
+    return re.sub(r"\s*(?:작성|검토|조사|제작|정리|확인)(?:\s*(?:및|후|하고|·|/)?\s*(?:공유|제출|전달))?(?:하기)?\s*$", "", value).strip() or value.strip()  # 단어 표기 차이로 정상 업무가 사라지지 않게 처리
+
+
+def source_personal_tasks(meeting_text):  # 명시적인 이름·업무·동사 문장은 원문에서 직접 복원
+    lines = [line.strip() for line in meeting_text.splitlines() if line.strip()]  # 원문 인용 보존
+    candidates = []  # 확실한 배정 문장만 처리
+    for line in lines:  # 다른 팀원의 일은 자동 생성하지 않음
+        body = re.sub(r"^[^:：\n]{1,20}[:：]\s*", "", line).strip()  # 발화자 이름 제거
+        body = re.sub(r"^(?:좋습니다|네|그러면|알겠습니다)[.,，]?\s*", "", body)  # 인사말만 제거
+        patterns = [rf"(?P<subject>[가-힣A-Za-z0-9 '·-]{{2,70}}?)(?:은|는|을|를)\s*{PERSONAL_NAME}\s*(?:대리|씨)?(?:가|는|에게)?\s*(?P<verb>작성|검토|조사|제작|정리|확인)", rf"{PERSONAL_NAME}\s*(?:대리|씨)?(?:가|는|에게)?\s*(?P<subject>[가-힣A-Za-z0-9 '·-]{{2,70}}?)(?:을|를)\s*(?P<verb>작성|검토|조사|제작|정리|확인)"]  # 명시적 배정의 두 어순
+        match = next((m for pattern in patterns if (m := re.search(pattern, body))), None)  # 실제 이름과 업무가 연결된 문장
+        if not match or re.search(r"지난번|예전에|않|아니|취소|제외|못했|좋겠|어떨|까요", body):  # 추천·과거 실적·취소·질문은 배정으로 보지 않음
+            continue  # 확정된 수행 지시만 복원
+        subject, verb = match.group("subject").strip(), match.group("verb")  # 원문의 대상과 행동
+        if len(subject) > 70 or personal_vague(subject):  # 불명확한 대상은 추정하지 않음
+            continue  # AI 분석과 검토 대상으로 남김
+        words = re.findall(r"[가-힣A-Za-z0-9]{2,}", subject)  # 같은 업무를 가리키는 원문 낱말
+        related = [q for q in lines if any(word in q for word in words) and not re.search(r"언제|까요", q)]  # 다른 업무의 기한을 섞지 않음
+        due_quote = next((q for q in reversed(related) if re.search(r"\d{1,2}월\s*\d{1,2}일\s*까지", q)), "")  # 해당 업무의 마지막 마감 발언
+        due = personal_extract_due([due_quote]) if due_quote else ""  # 새로운 날짜를 만들지 않음
+        recipient, recipient_quote = personal_extract_recipient(list(reversed(related)))  # 해당 업무의 명시된 공유 상대
+        steps = [{"kind": "work", "text": subject + " " + verb, "evidence": body}]  # 수행 단계
+        if recipient and re.search(r"공유|제출|전달|송부|보고", recipient_quote):  # 공유 지시도 실제로 있을 때만
+            steps.append({"kind": "deliver", "text": subject + "을 " + recipient + "에게 공유", "evidence": recipient_quote})  # 전달 일정 질문은 만들지 않음
+        candidates.append({"owner": PERSONAL_NAME, "subject": subject, "assignment_evidence": body, "due": due, "due_evidence": due_quote, "recipient": recipient, "recipient_evidence": recipient_quote, "steps": steps})  # 기존 검증도 통과해야 등록
+    return candidates  # 특정 파일·업무·날짜를 하드코딩하지 않음
+
+
 def personal_quote(value, meeting_text):  # 인용 문구가 원문에 있는지 확인
     return isinstance(value, str) and bool(value.strip()) and personal_compact(value) in personal_compact(meeting_text)  # 띄어쓰기 차이 허용
 
@@ -496,6 +525,7 @@ def validate_personal_tasks(payload, meeting_text):  # 소유자·원문·기한
             rejected += 1  # 손상된 후보 제외
             continue  # 다음 업무 확인
         item = {k: raw[k].strip() for k in fields}  # 앞뒤 공백 정리
+        item["subject"] = personal_subject(item["subject"])  # '초안 작성 및 공유'도 원문의 대상과 비교 가능하게 정리
         if not personal_owner(item["owner"]):  # 다른 사람에게 배정된 업무라면
             continue  # 내 업무에 포함하지 않음
         assignment = item["assignment_evidence"]  # 누구에게 무엇을 맡겼는지 보여주는 인용
@@ -561,7 +591,38 @@ due_evidence, recipient_evidence, 각 step의 evidence는 해당 정보가 실�
     response = client.responses.create(model="gpt-4o-mini", input=[{"role": "system", "content": instruction}, {"role": "user", "content": meeting_text}], text={"format": {"type": "json_schema", "name": "personal_assigned_work", "strict": True, "schema": PERSONAL_SCHEMA}}, temperature=0)  # 기존 모델·API 유지
     if getattr(response, "status", "completed") != "completed" or not response.output_text.strip():  # 중단·빈 결과
         raise ValueError("업무 정리가 완료되지 않았습니다. 기존 체크리스트는 유지됩니다.")  # 실패를 업무 없음으로 보지 않음
-    return validate_personal_tasks(json.loads(response.output_text), meeting_text)  # 자료와 원문 검증
+    payload = json.loads(response.output_text)  # 실제 모델 출력 보관
+    items, rejected = validate_personal_tasks(payload, meeting_text)  # 모델의 제안 검증
+    recovered, _ = validate_personal_tasks({"tasks": source_personal_tasks(meeting_text)}, meeting_text)  # 명시적 배정은 원문에서도 직접 복원
+    for task in recovered:  # 검증된 원문 배정을 우선
+        current = next((item for item in items if personal_compact(item["subject"]) == personal_compact(task["subject"])), None)  # 검증된 기존 단계는 보존
+        if current is None:  # 정상 배정이 통째로 제외된 경우
+            items.append(task)  # AI 표기 차이로 없어졌던 필수 업무 복구
+        else:  # 기존 업무의 누락 정보만 원문에서 보완
+            for field in ("due", "recipient"):  # 확정된 기한·공유 상대
+                if not current[field] and task[field]:  # 비어 있는 정보만
+                    current[field], current[field + "_evidence"] = task[field], task[field + "_evidence"]  # 원문 근거와 함께 복구
+            if not any(step["kind"] == "deliver" for step in current["steps"]):  # 공유 지시를 빠뜨린 경우에만
+                current["steps"].extend(step for step in task["steps"] if step["kind"] == "deliver")  # 다른 실행 단계는 삭제하지 않음
+    details = []  # 실제 제외 조건을 사용자가 볼 수 있게 설명
+    for raw in payload.get("tasks", []):  # 제안별 진단
+        _, count = validate_personal_tasks({"tasks": [raw]}, meeting_text)  # 같은 검증 결과 확인
+        if not count:  # 제외되지 않은 제안
+            continue  # 정상 제안 생략
+        reason = "수행 단계의 대상·행동·인용 문구 연결을 확인하지 못했습니다."  # 단계 검증 기본 설명
+        if not isinstance(raw, dict):  # 자료 형식 오류
+            reason = "업무 자료 형식이 올바르지 않습니다."  # 구조 오류
+        elif not personal_quote(raw.get("assignment_evidence"), meeting_text):  # 원문 인용 불일치
+            reason = "배정 근거의 인용 문구가 원문과 일치하지 않습니다."  # 표기·요약 문제
+        elif not personal_assignment_supported(raw.get("assignment_evidence", ""), personal_subject(raw.get("subject", ""))):  # 소유자 연결 문제
+            reason = "같은 배정 문장에서 김민수와 업무 대상을 함께 확인하지 못했습니다."  # 정확한 소유자 검증 조건
+        elif raw.get("due") and (not personal_quote(raw.get("due_evidence"), meeting_text) or personal_compact(raw["due"]) not in personal_compact(raw.get("due_evidence", ""))):  # 기한 표기 문제
+            reason = "기한 표기 또는 기한 근거가 원문과 일치하지 않습니다."  # 날짜 형식 차이도 표시
+        elif raw.get("recipient") and (not personal_quote(raw.get("recipient_evidence"), meeting_text) or personal_compact(raw["recipient"]) not in personal_compact(raw.get("recipient_evidence", ""))):  # 수신자 표기 문제
+            reason = "공유 대상의 표기 또는 근거가 원문과 일치하지 않습니다."  # 호칭 차이 표시
+        details.append({"업무": raw.get("subject", "") if isinstance(raw, dict) else "", "제외 이유": reason})  # 제안별 기록
+    st.session_state.personal_debug = {"proposed": payload.get("tasks", []), "reasons": details, "rejected": rejected, "recovered": len(recovered)}  # 실패했을 때 제안을 확인할 수 있게 기록
+    return items, rejected  # 원문에서 복원한 체크리스트는 제외 경고가 있어도 표시
 
 
 def personal_tasks(document_hash):  # 문서별 내 업무 조회
@@ -738,6 +799,11 @@ def render_personal_checklist(meeting_text):  # 수행 업무를 중심으로 �
         rejected = st.session_state.personal_rejected.get(document_hash, 0)  # 원문 검증 실패 건수
         if rejected:  # 무시된 후보가 있으면
             st.warning(f"원문 근거를 확인하지 못한 제안 {rejected}개는 제외했습니다. 회의록을 확인하거나 다시 정리해 주세요.")  # 빈 결과를 성공으로 포장하지 않음
+            with st.expander("제외된 AI 제안 확인"):  # 실제 출력 확인 없이 원인을 단정하지 않음
+                debug = st.session_state.get("personal_debug", {})  # 이번 분석의 제안
+                st.json(debug.get("reasons", []))  # 제안별로 해당 검증 조건 표시
+                st.json(debug.get("proposed", []))  # 사용자가 원문과 대조 가능
+                st.caption("업무 대상의 표현, 배정 근거, 수행 단계, 기한·공유 대상의 원문 연결 조건에서 제외될 수 있습니다.")  # 검사 범위 표시
         if not tasks:  # 등록된 내 업무가 없다면
             if st.session_state.personal_analyzed.get(document_hash):  # 분석을 마쳤다면
                 st.info("이 회의록에서 김민수 대리에게 명시적으로 배정된 업무를 찾지 못했습니다." if not rejected else "원문 근거를 확인한 내 업무가 없습니다.")  # 다른 사람의 일을 대신 등록하지 않음
@@ -782,8 +848,12 @@ def render_personal_checklist(meeting_text):  # 수행 업무를 중심으로 �
                         remove_personal_task(document_hash, task["id"])  # 선택 업무만 제거
                         st.rerun()  # 남은 업무 표시
         checks = [check for task in tasks for check in personal_required_checks(task)]  # 미완료 내 업무의 필수 공백만
-        if not checks and not rejected:  # 실제 내 업무에 공백이 없다면
-            st.caption("추가로 꼭 확인할 사항이 없습니다.")  # 확인 과제를 억지로 만들지 않음
+        with st.expander("확인 체크리스트", expanded=bool(checks)):  # 기존의 확인 목록 영역도 유지
+            if checks:  # 내 업무에 꼭 필요한 정보가 빠진 경우
+                for check in checks:  # 필요한 항목만 나열
+                    st.markdown("- " + check)  # 다른 사람의 확인 업무는 넣지 않음
+            else:  # 실제 내 업무에 필수 공백이 없다면
+                st.caption("추가로 꼭 확인할 사항이 없습니다.")  # 빈 화면 대신 현재 상태 표시
         with st.expander("내 업무 목록 공유"):  # 부가 도구는 접어서 표시
             draft = personal_share_text(document_hash, document_name)  # 남은 실행 단계만 정리
             if draft:  # 미완료 업무가 있다면
